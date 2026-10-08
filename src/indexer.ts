@@ -15,6 +15,12 @@ export interface Chunk {
 /** 中文友好的切块参数 */
 const CHUNK_TOKENS = 400   // 约 400 token（≈600 汉字）/块
 const OVERLAP_RATIO = 0.1  // 块间 10% 重叠
+/**
+ * 节标题行：`##` ~ `######` 视为节标题，遇之强制断块（保证「一节 = 一块」）。
+ * 刻意不含单级 `#`——nginx/shell/mysql 等配置与代码的注释普遍用单 `#` 开头，
+ * 误判会把命令序列切碎（实测语音平台文档 27 节被切成 231 块）。
+ */
+const HEADING_RE = /^#{2,6} /
 
 // ── 文档解析 ──────────────────────────────────────────────
 
@@ -40,28 +46,64 @@ export async function extractText(filePath: string): Promise<{ text: string; pag
 
 // ── 切块 ──────────────────────────────────────────────
 
-/** 标题感知切块：按标题/空行分段，过长段再固定长度切 */
+/** 标题感知切块：节标题强制断块（一节 = 一块）+ 空行分段 + 过长滑窗兜底 */
 export function chunkText(text: string): string[] {
   const normalized = text.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
   if (normalized === '') return []
-  // 按标题（# 开头行）和空行分段
-  const paragraphs = normalized.split(/\n(?=#{1,4} )|\n\n+/).map(p => p.trim()).filter(p => p !== '')
+  // 按标题（## 开头行）和空行分段
+  const paragraphs = normalized.split(/\n(?=#{2,6} )|\n\n+/).map(p => p.trim()).filter(p => p !== '')
   const chunks: string[] = []
   let current = ''
+  let sectionHeading = ''  // 最近一次节标题，供超长段滑窗切分时补回上下文
   const maxChars = CHUNK_TOKENS * 1.5  // 中文 token≈1.5 字符
   const overlap = Math.floor(maxChars * OVERLAP_RATIO)
   for (const para of paragraphs) {
-    if (current !== '' && (current + '\n' + para).length > maxChars) {
+    const isHeading = HEADING_RE.test(para)
+    if (isHeading) sectionHeading = para.split('\n')[0]!.trim()
+    // 遇节标题强制断块：让每节独立成块，引用溯源可精确到节；
+    // 此处不带重叠，避免上一节内容混入下一节的检索结果
+    if (isHeading && current !== '') {
       chunks.push(current)
-      current = overlap > 0 && current.length > overlap ? current.slice(-overlap) : ''
+      current = ''
     }
-    if (para.length > maxChars * 2) {
-      // 超长段（如整篇无结构的 txt）：滑窗切
-      if (current !== '') { chunks.push(current); current = '' }
-      for (let i = 0; i < para.length; i += maxChars - overlap) {
-        chunks.push(para.slice(i, i + maxChars))
+    // 超长段（无结构长文 / 长命令序列）：滑窗切分。
+    // 门槛取 1.2 倍而非 2 倍——超过此长度的段直接成块会撑爆 embedding 上限被截断
+    if (para.length > maxChars * 1.2) {
+      const prefix = current
+      current = ''
+      // 前文很短（如「节标题 + 来源行」）时并入首块，避免留下没有正文的空壳块
+      const mergePrefix = prefix !== '' && prefix.length <= maxChars * 0.6
+      if (prefix !== '' && !mergePrefix) chunks.push(prefix)
+      for (let i = 0; i < para.length;) {
+        let end = Math.min(i + maxChars, para.length)
+        // 尽量在换行处收尾：命令/配置从中间截断会同时毁掉前后两块的可读性
+        if (end < para.length) {
+          const nl = para.lastIndexOf('\n', end)
+          if (nl > i + maxChars * 0.5) end = nl + 1
+        }
+        const piece = para.slice(i, end)
+        const isFirst = i === 0
+        i = end
+        chunks.push(
+          isFirst
+            ? (mergePrefix ? `${prefix}\n\n${piece}` : piece)
+            : (sectionHeading !== '' ? `${sectionHeading}\n\n${piece}` : piece),
+        )
       }
+      // 重置为节标题而非空串：紧随其后的普通段落累积时才不会丢掉出处
+      current = sectionHeading
       continue
+    }
+    // 软下限 + 硬上限：当前块过短时（如仅「节标题 + 来源行」）宁可略微超长也不单独成块，
+    // 否则会留下没有正文的空壳块；但合并后超过硬上限就必须断开
+    const merged = current + '\n' + para
+    if (current !== '' && merged.length > maxChars
+      && (current.length >= maxChars * 0.5 || merged.length > maxChars * 1.2)) {
+      chunks.push(current)
+      // 能走到这里说明当前块已达软下限，可以安全携带重叠
+      const tail = overlap > 0 ? current.slice(-overlap) : ''
+      // 续块补回节标题：长节会被切成多块，带标题才能让每块都看得出出处
+      current = sectionHeading !== '' ? `${sectionHeading}\n\n${tail}` : tail
     }
     current = current === '' ? para : current + '\n' + para
   }
