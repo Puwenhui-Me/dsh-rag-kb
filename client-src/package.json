@@ -1,0 +1,11 @@
+{
+  "name": "rag-kb-client-src",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "tsdown && node scripts/normalize-banner.mjs" },
+  "devDependencies": {
+    "@types/react": "^18.3.1",
+    "react": "^18.3.1",
+    "tsdown": "^0.22.14"
+  }
+}

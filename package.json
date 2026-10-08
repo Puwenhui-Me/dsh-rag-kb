@@ -1,0 +1,57 @@
+{
+  "name": "@puwenhui/dsh-rag-kb",
+  "version": "0.1.0",
+  "description": "DSH RAG 知识库插件：文档导入→切块→本地向量化→语义检索，knowledge_search 工具 + 会话语义管理 + 设置面板",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Puwenhui-Me/dsh-rag-kb.git"
+  },
+  "homepage": "https://github.com/Puwenhui-Me/dsh-rag-kb#readme",
+  "type": "module",
+  "main": "lib/plugin.mjs",
+  "exports": {
+    ".": "./lib/plugin.mjs",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/plugin.mjs",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "USAGE.zh.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-theme"
+      ]
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "@huggingface/transformers": "^3.7.2",
+    "mammoth": "^1.11.0",
+    "unpdf": "^0.12.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "tsdown": "^0.23.0",
+    "typescript": "^7.0.2"
+  },
+  "license": "MIT"
+}

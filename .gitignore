@@ -1,0 +1,9 @@
+node_modules/
+client-src/node_modules/
+lib/client.js.map
+*.tgz
+*.db
+*.db-wal
+*.db-shm
+data/
+hf-cache/
