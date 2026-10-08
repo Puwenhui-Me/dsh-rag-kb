@@ -67,6 +67,10 @@ export class KbStore {
         FOREIGN KEY(doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
       );
       CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
+      CREATE VIRTUAL TABLE IF NOT EXISTS chunk_fts USING fts5(
+        text,
+        tokenize='trigram'
+      );
     `)
   }
 
@@ -96,6 +100,10 @@ export class KbStore {
   }
 
   deleteDoc(docId: string): void {
+    // 先删 FTS 行（需要 chunks.id 对齐的 rowid）
+    const ids = this.db.prepare('SELECT id FROM chunks WHERE doc_id=?').all(docId) as Array<{ id: number }>
+    const ftsDel = this.db.prepare('DELETE FROM chunk_fts WHERE rowid=?')
+    for (const { id } of ids) ftsDel.run(id)
     this.db.prepare('DELETE FROM chunks WHERE doc_id=?').run(docId)
     this.db.prepare('DELETE FROM documents WHERE doc_id=?').run(docId)
     this.loaded = false
@@ -109,14 +117,22 @@ export class KbStore {
     return this.db.prepare('SELECT * FROM documents WHERE doc_id=?').get(docId) as DocumentRow | undefined
   }
 
-  /** 批量写入切块+向量（一个事务，失败回滚） */
+  /** 批量写入切块+向量+FTS 索引（一个事务，失败回滚） */
   insertChunks(docId: string, chunks: Array<{ seq: number; text: string; embedding: Float32Array }>): void {
     this.db.exec('BEGIN')
     try {
       this.db.prepare('DELETE FROM chunks WHERE doc_id=?').run(docId)
+      // FTS 行以 chunks.id 的 rowid 对齐——先删旧 FTS 行再插新的
+      const oldIds = this.db.prepare('SELECT id FROM chunks WHERE doc_id=?').all(docId) as Array<{ id: number }>
+      const ftsDel = this.db.prepare('DELETE FROM chunk_fts WHERE rowid=?')
+      for (const { id } of oldIds) ftsDel.run(id)
       const stmt = this.db.prepare('INSERT INTO chunks(doc_id, seq, text, embedding) VALUES(?,?,?,?)')
+      const ftsIns = this.db.prepare('INSERT INTO chunk_fts(rowid, text) VALUES(?,?)')
       for (const c of chunks) {
-        stmt.run(docId, c.seq, c.text, Buffer.from(c.embedding.buffer, c.embedding.byteOffset, c.embedding.byteLength))
+        const buf = Buffer.from(c.embedding.buffer, c.embedding.byteOffset, c.embedding.byteLength)
+        const info = stmt.run(docId, c.seq, c.text, buf) as { lastInsertRowid: number | bigint }
+        const rowid = Number(info.lastInsertRowid)
+        ftsIns.run(rowid, c.text)
       }
       this.db.exec('COMMIT')
     } catch (e) {
@@ -139,18 +155,72 @@ export class KbStore {
     this.loaded = true
   }
 
-  /** 余弦相似检索（向量已归一化，等价点积） */
-  search(queryVec: Float32Array, topK: number, minScore: number): Array<{ docId: string; seq: number; score: number }> {
+  /** 混合检索：向量余弦 + FTS5 关键词双路合并（加权排序） */
+  hybridSearch(
+    queryVec: Float32Array,
+    queryText: string,
+    topK: number,
+    minScore: number,
+  ): Array<{ docId: string; seq: number; score: number; via: 'vector' | 'keyword' | 'both' }> {
     this.ensureLoaded()
-    const scored: Array<{ docId: string; seq: number; score: number }> = []
+    // 路1：向量余弦
+    const vectorScores = new Map<string, { docId: string; seq: number; score: number }>()
     for (let i = 0; i < this.vectors.length; i++) {
       const v = this.vectors[i]!
       let dot = 0
       for (let j = 0; j < queryVec.length; j++) dot += queryVec[j]! * v[j]!
-      if (dot >= minScore) scored.push({ docId: this.vectorRows[i]!.docId, seq: this.vectorRows[i]!.seq, score: dot })
+      if (dot >= minScore) {
+        const key = `${this.vectorRows[i]!.docId}:${this.vectorRows[i]!.seq}`
+        vectorScores.set(key, { docId: this.vectorRows[i]!.docId, seq: this.vectorRows[i]!.seq, score: dot })
+      }
     }
-    scored.sort((a, b) => b.score - a.score)
-    return scored.slice(0, topK)
+    // 路2：FTS5 trigram 关键词
+    const keywordScores = new Map<string, { docId: string; seq: number; score: number }>()
+    if (queryText.trim().length >= 3) {
+      try {
+        // trigram 要求连续 3+ 字符——把 query 清理后整段做 phrase 搜索
+        // 中英混合 query 截取前 50 字符（避免过长 FTS 查询慢）
+        const safe = queryText.replace(/["'*()\-:]/g, ' ').trim().slice(0, 50)
+        if (safe.length >= 3) {
+          const rows = this.db.prepare(`
+            SELECT c.doc_id, c.seq, bm25(chunk_fts) AS rank
+            FROM chunk_fts f
+            JOIN chunks c ON c.id = f.rowid
+            WHERE chunk_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+          `).all(`"${safe}"`, topK * 2) as Array<{ doc_id: string; seq: number; rank: number }>
+          for (const row of rows) {
+            const key = `${row.doc_id}:${row.seq}`
+            const kwScore = 1 / (1 + Math.abs(row.rank))
+            keywordScores.set(key, { docId: row.doc_id, seq: row.seq, score: kwScore })
+          }
+        }
+      } catch { /* FTS 查询出错不影响向量路 */ }
+    }
+    // 合并双路：同一 chunk 两路都命中 = 强信号，加权提分
+    const merged = new Map<string, { docId: string; seq: number; score: number; via: 'vector' | 'keyword' | 'both' }>()
+    for (const [key, v] of vectorScores) {
+      merged.set(key, { ...v, score: v.score, via: keywordScores.has(key) ? 'both' : 'vector' })
+    }
+    for (const [key, k] of keywordScores) {
+      if (merged.has(key)) {
+        // 双路命中：向量分 + 关键词分 × 0.3 加成（关键词是辅助信号）
+        const existing = merged.get(key)!
+        existing.score = existing.score + k.score * 0.3
+        existing.via = 'both'
+      } else {
+        merged.set(key, { ...k, via: 'keyword' })
+      }
+    }
+    const results = [...merged.values()].sort((a, b) => b.score - a.score)
+    return results.slice(0, topK)
+  }
+
+  /** 向后兼容：纯向量检索（内部调 hybridSearch 空 queryText） */
+  search(queryVec: Float32Array, topK: number, minScore: number): Array<{ docId: string; seq: number; score: number }> {
+    const results = this.hybridSearch(queryVec, '', topK, minScore)
+    return results.map(r => ({ docId: r.docId, seq: r.seq, score: r.score }))
   }
 
   /** 按 doc_id + seq 取 chunk 原文 */

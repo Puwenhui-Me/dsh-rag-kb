@@ -1,7 +1,7 @@
 {
   "name": "@puwenhui/dsh-rag-kb",
-  "version": "0.1.0",
-  "description": "DSH RAG 知识库插件：文档导入→切块→本地向量化→语义检索，knowledge_search 工具 + 会话语义管理 + 设置面板",
+  "version": "0.2.0",
+  "description": "DSH RAG 知识库插件：混合检索(向量+FTS5)+Reranker 重排+GPU 加速+引用溯源+会话语义管理",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
     "access": "public"

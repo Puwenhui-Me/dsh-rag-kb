@@ -16,7 +16,7 @@ interface NamespaceView {
 interface FieldDef {
   key: string
   label: string
-  type: 'string' | 'number'
+  type: 'string' | 'number' | 'boolean'
   placeholder?: string
   hint?: string
 }
@@ -26,6 +26,8 @@ const FIELDS: FieldDef[] = [
   { key: 'watchDir', label: '自动索引目录', type: 'string', placeholder: 'D:\\docs', hint: '放入此目录的文档自动监视索引（可选）' },
   { key: 'topK', label: '检索返回条数', type: 'number', hint: '默认 5' },
   { key: 'minScore', label: '相似度阈值', type: 'number', hint: '0~1，默认 0.3，过低噪音多' },
+  { key: 'enableReranker', label: '启用 Reranker 重排序', type: 'boolean', hint: '首次使用会下载约 500MB 模型' },
+  { key: 'rerankTopN', label: '重排后返回条数', type: 'number', hint: '默认 3' },
 ]
 
 export function KbSettingsTab(props: { face: SettingsFace }): JSX.Element {
@@ -115,29 +117,53 @@ export function KbSettingsTab(props: { face: SettingsFace }): JSX.Element {
     <div>
       <div style={cardStyle}>
         <strong style={{ fontSize: '14px' }}>知识库</strong>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '10px', marginTop: '12px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 14px', marginTop: '12px' }}>
           {FIELDS.map((f) => {
             const overridden = Object.hasOwn(userLayer, f.key)
+            const isBoolean = f.type === 'boolean'
             return (
-              <label key={f.key} style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '13px' }}>
+              <label key={f.key} style={{ display: 'flex', flexDirection: 'column', gap: '4px', fontSize: '13px', ...(isBoolean ? { gridColumn: 'span 1', justifyContent: 'center' } : {}) }}>
                 <span style={{ color: 'var(--dsw-alias-label-secondary)' }}>
                   {f.label}
                   {overridden && <span style={{ marginLeft: '6px', color: 'var(--dsw-alias-brand-primary)' }}>·已覆盖</span>}
                 </span>
-                <input
-                  value={draft !== null && draft[f.key] !== undefined ? String(draft[f.key]) : String(shown[f.key] ?? '')}
-                  placeholder={f.placeholder ?? ''}
-                  onChange={(e) => {
-                    // 编辑期间保留原始字符串（含 "0." 等中间态），保存时才转数字
-                    edit(f.key, e.target.value)
-                  }}
-                  style={inputStyle}
-                />
+                {isBoolean ? (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '4px 0' }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                      <input
+                        type="radio"
+                        name={f.key}
+                        checked={shown[f.key] === true}
+                        onChange={() => { edit(f.key, true) }}
+                      />
+                      <span>开</span>
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                      <input
+                        type="radio"
+                        name={f.key}
+                        checked={shown[f.key] !== true}
+                        onChange={() => { edit(f.key, false) }}
+                      />
+                      <span>关</span>
+                    </label>
+                  </div>
+                ) : (
+                  <input
+                    value={draft !== null && draft[f.key] !== undefined ? String(draft[f.key]) : String(shown[f.key] ?? '')}
+                    placeholder={f.placeholder ?? ''}
+                    onChange={(e) => {
+                      // 编辑期间保留原始字符串（含 "0." 等中间态），保存时才转数字
+                      edit(f.key, e.target.value)
+                    }}
+                    style={inputStyle}
+                  />
+                )}
                 {f.hint !== undefined && <span style={{ fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)' }}>{f.hint}</span>}
               </label>
             )
           })}
-          <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginTop: '4px' }}>
+          <div style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: '10px', marginTop: '4px' }}>
             <button type="button" disabled={saving || draft === null} onClick={() => { void save() }}
               style={{
                 padding: '6px 16px', borderRadius: '6px', font: 'inherit',

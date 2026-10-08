@@ -6,36 +6,44 @@
 import z from '@deepseek-ai/schemastery'
 
 export interface KbConfig {
-  /** 本地目录路径——放入的文档自动监视索引（V2 目录模式的锚点，V1 也生效） */
+  /** 本地目录路径——放入的文档自动监视索引 */
   watchDir: string
   /** 检索返回 top-K */
   topK: number
   /** 相似度阈值（0~1，低于此值的 chunk 不返回） */
   minScore: number
-  /** 知识库描述——agent 检索前阅读，知道库里有什么类型内容 */
+  /** 知识库描述——agent 检索前阅读 */
   description: string
-  /** embedding 模型（transformers.js 模型名） */
+  /** embedding 模型 */
   embeddingModel: string
   /** 批量推理大小 */
   batchSize: number
+  /** 是否启用 reranker 重排序 */
+  enableReranker: boolean
+  /** 重排后返回条数 */
+  rerankTopN: number
 }
 
 /** 用户可见配置（设置面板「知识库」标签页） */
 export const PublicConfig = z.object({
   watchDir: z.string().default('').description('本地文档目录（放入即自动索引）'),
-  topK: z.number().default(5).description('检索返回条数（默认 5）'),
+  topK: z.number().default(5).description('混合检索召回条数（默认 5）'),
   minScore: z.number().default(0.3).description('相似度阈值（0~1，默认 0.3）'),
   description: z.string().default('').description('知识库描述（agent 检索前会阅读）'),
+  enableReranker: z.boolean().default(false).description('启用 reranker 重排序（首次下载约 500MB 模型）'),
+  rerankTopN: z.number().default(3).description('重排后返回条数（默认 3）'),
 })
 
 /** 完整配置（含高级项） */
 export const Config = z.object({
   watchDir: z.string().default('').description('本地文档目录'),
-  topK: z.number().default(5).description('检索返回条数'),
+  topK: z.number().default(5).description('混合检索召回条数'),
   minScore: z.number().default(0.3).description('相似度阈值'),
   description: z.string().default('').description('知识库描述'),
   embeddingModel: z.string().default('Xenova/bge-small-zh-v1.5').description('embedding 模型'),
   batchSize: z.number().default(32).description('批量推理大小'),
+  enableReranker: z.boolean().default(false).description('启用 reranker 重排序'),
+  rerankTopN: z.number().default(3).description('重排后返回条数'),
 })
 
 /** 全字段 volatile 注入（npm 版 schemastery 无 .volatile()，0.2.0 设置面板只收录 volatile 字段） */
@@ -54,5 +62,7 @@ export function resolveKbConfig(c: Partial<KbConfig> = {}): KbConfig {
     description: c.description ?? '',
     embeddingModel: c.embeddingModel ?? 'Xenova/bge-small-zh-v1.5',
     batchSize: Math.max(1, Math.min(128, c.batchSize ?? 32)),
+    enableReranker: c.enableReranker === true,
+    rerankTopN: Math.max(1, Math.min(20, c.rerankTopN ?? 3)),
   }
 }

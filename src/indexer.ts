@@ -69,36 +69,44 @@ export function chunkText(text: string): string[] {
   return chunks.filter(c => c.trim().length >= 10)  // 过滤过短碎片
 }
 
-// ── 向量化（transformers.js，GPU 优先自动回退 CPU） ──
+// ── 向量化（GPU 索引 + CPU 查询双模式） ──
+// DML(DirectML) GPU 批量索引快 4 倍；单条查询 GPU 有调度开销反而慢，
+// 所以索引用 DML、检索用 CPU——两条 pipeline 按需惰性加载。
 
-let pipelinePromise: Promise<Awaited<ReturnType<typeof loadPipeline>>> | undefined
+let gpuPipeline: Awaited<ReturnType<typeof loadPipeline>> | undefined
+let cpuPipeline: Awaited<ReturnType<typeof loadPipeline>> | undefined
 
-async function loadPipeline(modelName: string) {
+async function loadPipeline(modelName: string, device: 'cpu' | 'dml') {
   const { pipeline, env } = await import('@huggingface/transformers')
-  // 模型缓存放 $DSH_HOME/rag-kb/hf-cache（首次下载 ~100MB 后离线）
   const { dshHomePath } = await import('@deepseek-ai/dsh-home-paths')
   env.cacheDir = dshHomePath('rag-kb', 'hf-cache')
-  // GPU 加速：transformers.js 在 Node 里通过 onnxruntime-node 的 CUDA EP 生效；
-  // 未装 CUDA EP 或无 GPU 时自动回退 CPU（多核并行同样毫秒级）
-  return pipeline('feature-extraction', modelName)
+  try {
+    return await pipeline('feature-extraction', modelName, { device })
+  } catch (e) {
+    // DML 不可用（无 GPU/驱动不兼容）→ 回退 CPU
+    if (device === 'dml') {
+      console.log('[rag-kb] DML GPU 不可用，回退 CPU')
+      return await pipeline('feature-extraction', modelName, { device: 'cpu' })
+    }
+    throw e
+  }
 }
 
 export async function getEmbedder(modelName: string) {
-  pipelinePromise ??= loadPipeline(modelName)
-  const embedder = await pipelinePromise
   return {
-    /** 单条向量化（检索查询用） */
+    /** 单条向量化（检索查询用，CPU 单条比 GPU 快） */
     async embed(text: string): Promise<Float32Array> {
-      const out = await embedder(text, { pooling: 'cls', normalize: true })
+      cpuPipeline ??= await loadPipeline(modelName, 'cpu')
+      const out = await cpuPipeline(text, { pooling: 'cls', normalize: true })
       return new Float32Array(out.data)
     },
-    /** 批量向量化（索引用，batch 推理吃满多核/GPU） */
+    /** 批量向量化（索引用，GPU/DML 批量快 4 倍，不可用自动回退 CPU） */
     async embedBatch(texts: string[], batchSize: number): Promise<Float32Array[]> {
+      gpuPipeline ??= await loadPipeline(modelName, 'dml')
       const results: Float32Array[] = []
       for (let i = 0; i < texts.length; i += batchSize) {
         const batch = texts.slice(i, i + batchSize)
-        const out = await embedder(batch, { pooling: 'cls', normalize: true })
-        // batch 输出 [batch, dim] 展平
+        const out = await gpuPipeline(batch, { pooling: 'cls', normalize: true })
         const dim = out.data.length / batch.length
         for (let j = 0; j < batch.length; j++) {
           results.push(new Float32Array(out.data.slice(j * dim, (j + 1) * dim)))
@@ -107,6 +115,36 @@ export async function getEmbedder(modelName: string) {
       return results
     },
   }
+}
+
+// ── Reranker（bge-reranker-base，本地 CPU，惰性加载） ──
+
+let rerankerPipeline: Awaited<ReturnType<typeof loadReranker>> | undefined
+
+async function loadReranker() {
+  const { pipeline, env } = await import('@huggingface/transformers')
+  const { dshHomePath } = await import('@deepseek-ai/dsh-home-paths')
+  env.cacheDir = dshHomePath('rag-kb', 'hf-cache')
+  return pipeline('text-classification', 'Xenova/bge-reranker-base')
+}
+
+/**
+ * 对混合检索结果做 cross-encoder 精排。
+ * 输入：query + 候选列表（含原文），输出按相关性重排序。
+ */
+export async function rerank(
+  query: string,
+  candidates: Array<{ text: string; [key: string]: unknown }>,
+): Promise<Array<{ text: string; rerankScore: number; [key: string]: unknown }>> {
+  rerankerPipeline ??= await loadReranker()
+  const pairs = candidates.map(c => ({ text: query, text_pair: c.text }))
+  const scores = await rerankerPipeline(pairs)
+  const scored = candidates.map((c, i) => ({
+    ...c,
+    rerankScore: scores[i].score as number,
+  }))
+  scored.sort((a, b) => b.rerankScore - a.rerankScore)
+  return scored
 }
 
 /** 完整索引管线：文件路径 → 切块+向量数组 */

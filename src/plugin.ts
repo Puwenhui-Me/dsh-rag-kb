@@ -12,7 +12,7 @@ import { existsSync, statSync } from 'node:fs'
 import type { Context } from '@deepseek-ai/cordis'
 import { Config, resolveKbConfig, type KbConfig } from './config.ts'
 import { KbStore } from './store.ts'
-import { getEmbedder, indexFile } from './indexer.ts'
+import { getEmbedder, indexFile, rerank } from './indexer.ts'
 
 export const ConfigExport = Config
 
@@ -62,18 +62,48 @@ async function indexOne(ctx: Context, filePath: string, source: 'upload' | 'watc
   }
 }
 
-/** 语义检索 */
-async function search(query: string, topK?: number): Promise<Array<{ doc: string; seq: number; score: number; text: string }>> {
+/** 混合语义检索（向量+关键词）+ 可选 reranker 精排 + 引用元数据 */
+async function search(query: string, topK?: number): Promise<Array<{
+  doc: string; seq: number; score: number; via: string; rerankScore?: number;
+  text: string; citation: string; position: string;
+}>> {
   const s = await ensureStore()
   const embedder = await getEmbedder(cfg?.embeddingModel ?? 'Xenova/bge-small-zh-v1.5')
   const queryVec = await embedder.embed(query)
-  const hits = s.search(queryVec, topK ?? cfg?.topK ?? 5, cfg?.minScore ?? 0.3)
-  return hits.map(h => ({
-    doc: s.getDoc(h.docId)?.name ?? h.docId,
-    seq: h.seq,
-    score: Number(h.score.toFixed(3)),
-    text: s.chunkText(h.docId, h.seq).slice(0, 800),
-  }))
+  const effectiveTopK = topK ?? cfg?.topK ?? 5
+  const recallK = cfg?.enableReranker === true ? effectiveTopK * 3 : effectiveTopK
+  const hits = s.hybridSearch(queryVec, query, recallK, cfg?.minScore ?? 0.3)
+  let results: Array<{ docId: string; doc: string; seq: number; score: number; via: string; text: string; citation: string; position: string; rerankScore?: number }> = hits.map(h => {
+    const docName = s.getDoc(h.docId)?.name ?? h.docId
+    const fullText = s.chunkText(h.docId, h.seq)
+    return {
+      docId: h.docId,
+      doc: docName,
+      seq: h.seq,
+      score: Number(h.score.toFixed(3)),
+      via: h.via,
+      text: fullText,
+      citation: `${docName} 第${h.seq + 1}段`,
+      position: `文档「${docName}」第 ${h.seq + 1} 段`,
+    }
+  })
+  if (cfg?.enableReranker === true && results.length > 0) {
+    try {
+      const reranked = await rerank(query, results)
+      const topN = cfg?.rerankTopN ?? 3
+      results = reranked.slice(0, topN).map(r => ({
+        ...(r as typeof results[number]),
+        text: (r as { text: string }).text.slice(0, 800),
+        rerankScore: Number((r as { rerankScore: number }).rerankScore.toFixed(4)),
+      }))
+    } catch (e) {
+      console.warn('[rag-kb] reranker 失败，使用混合检索结果:', String((e as Error).message ?? e))
+      results = results.slice(0, effectiveTopK).map(r => ({ ...r, text: r.text.slice(0, 800) }))
+    }
+  } else {
+    results = results.slice(0, effectiveTopK).map(r => ({ ...r, text: r.text.slice(0, 800) }))
+  }
+  return results
 }
 
 export function apply(ctx: Context, config: Partial<KbConfig> = {}): void {
@@ -135,9 +165,9 @@ export function apply(ctx: Context, config: Partial<KbConfig> = {}): void {
     // ① 语义检索
     ctx.tools.register({
       name: 'knowledge_search',
-      description: '在本地知识库中语义检索。返回最相关的知识块（带来源文档名、相似度、原文片段）。回答与知识库内容相关的问题前应先检索。query 支持自然语言。',
+      description: '在本地知识库中混合检索（语义向量 + 关键词）。返回最相关的知识块，每条带 citation 引用标注。回答知识库相关问题时：先检索 → 组织回答 → 在答案中标注来源 citation。query 支持自然语言和精确关键词（错误码/型号/人名等）。',
       parameters: compileParams({
-        query: { type: 'string', required: true, description: '检索问题（自然语言，中英文均可）' },
+        query: { type: 'string', required: true, description: '检索问题（自然语言或精确关键词）' },
         top_k: { type: 'number', description: '返回条数（默认 5）' },
       }),
       output: { schema: {} as Record<string, never>, render: (_a: unknown, v: unknown) => [{ type: 'text' as const, text: JSON.stringify(v) }] },
@@ -253,11 +283,13 @@ export function apply(ctx: Context, config: Partial<KbConfig> = {}): void {
     const docs = store?.listDocs().filter(d => d.status === 'ready').length ?? 0
     return [
       'You have a local knowledge base accessible via these tools:',
-      '- knowledge_search: semantic search the KB (use BEFORE answering questions about its content)',
+      '- knowledge_search: hybrid search (semantic + keyword). Use BEFORE answering questions about KB content.',
       '- knowledge_status: list documents and config',
       '- knowledge_manage: add/save/remove/reindex documents',
+      'IMPORTANT: When the user says 搜一下/查一下/搜索, FIRST try knowledge_search on the local KB. Only do a web search if KB has no relevant results AND the topic is clearly not about local documents. Do NOT search both simultaneously — this confuses the answer.',
       desc !== '' ? `KB description: ${desc}` : '',
       `Currently ${docs} document(s) indexed.`,
+      'CITATION STYLE (footnote format): In the body of your answer, mark sources with superscript numbers like ¹ ² ³ (Unicode superscripts). At the END, add a "参考来源" section. IMPORTANT: MERGE citations from the same document into ONE entry — e.g. if citing 文档A 第1段/第2段/第3段, list as "1. 文档A 第1-3段" (not 3 separate lines). Only list each document once with all its paragraph numbers combined. Keep the answer body clean.',
       'When the user says "save this to the knowledge base" (保存到知识库/记下来), extract the valuable content from the conversation and call knowledge_manage with action="save", providing a concise title and the text.',
       'For file/directory indexing use action="add" with a path.',
     ].filter(Boolean).join('\n')
