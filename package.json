@@ -1,6 +1,6 @@
 {
   "name": "@puwenhui/dsh-rag-kb",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "DSH RAG 知识库插件：混合检索(向量+FTS5)+Reranker 重排+GPU 加速+引用溯源+会话语义管理",
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",

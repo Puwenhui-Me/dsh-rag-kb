@@ -24,6 +24,12 @@ let store: KbStore | undefined
 let cfg: KbConfig | undefined
 const progressListeners = new Set<(msg: string) => void>()
 
+/** 目录监视与启动扫描支持的文件类型（两处必须用同一份，否则会出现「监视到了却扫不到」的错位） */
+const WATCH_EXT = /\.(pdf|docx|md|txt|csv|json|log)$/i
+
+/** 去掉扩展名：save 文档的 name 是标题（无后缀），文件文档的 name 带后缀，比对前需归一 */
+const stripExt = (n: string): string => n.replace(WATCH_EXT, '')
+
 function broadcastProgress(msg: string): void {
   for (const write of progressListeners) { try { write(`event: progress\ndata: ${JSON.stringify(msg)}\n\n`) } catch { /* 连接已断 */ } }
 }
@@ -41,11 +47,22 @@ async function indexOne(ctx: Context, filePath: string, source: 'upload' | 'watc
   const name = basename(filePath)
   const bytes = statSync(filePath).size
   const content = await (await import('node:fs/promises')).readFile(filePath)
-  const docId = KbStore.docId(content)
-  if (s.hasDoc(docId) && s.getDoc(docId)?.status === 'ready') {
+  // doc_id 取文件路径而非内容：同一文件内容变化时走覆盖更新，不会在库里留下旧版本
+  const docId = KbStore.docIdFromPath(filePath)
+  const hash = KbStore.hashContent(content)
+  // 清理 docId 语义变更（内容哈希 → 路径哈希）留下的同名旧记录：旧 id 与新 id 对不上，
+  // 覆盖不掉，不清掉会一直参与检索返回旧块。
+  // · content_hash 为空串是旧记录的可靠标记（migration 补列默认值），新记录必然非空，不会误删
+  // · 比对前去扩展名（save 文档 name 是标题、文件文档带后缀），否则 save 存的旧记录永远配不上
+  // · 必须放在「已索引则跳过」之前，否则文件一旦索引过就再也走不到这里
+  for (const d of s.listDocs()) {
+    if (d.content_hash === '' && stripExt(d.name) === stripExt(name)) s.deleteDoc(d.doc_id)
+  }
+  const prev = s.getDoc(docId)
+  if (prev?.status === 'ready' && prev.content_hash === hash) {
     return { ok: true, message: `${name} 已索引（内容未变化，跳过）` }
   }
-  s.upsertDoc(docId, name, source, bytes, 'indexing')
+  s.upsertDoc(docId, name, source, bytes, hash, 'indexing')
   broadcastProgress(`正在索引 ${name}`)
   try {
     const embedder = await getEmbedder(cfg?.embeddingModel ?? 'Xenova/bge-small-zh-v1.5')
@@ -60,6 +77,29 @@ async function indexOne(ctx: Context, filePath: string, source: 'upload' | 'watc
     broadcastProgress(`${name} 索引失败：${msg}`)
     return { ok: false, message: `${name} 索引失败：${msg}` }
   }
+}
+
+/**
+ * 启动时补索引：扫描 watchDir 里已存在但尚未入库的文件。
+ * watch() 只捕获监视建立之后的变动，DSH 未运行期间放进目录的文件它看不到，故需补扫。
+ * 内容未变化的已入库文件会被 indexOne 直接跳过，不会重复向量化。
+ */
+async function scanWatchDir(ctx: Context, dir: string): Promise<void> {
+  let names: string[]
+  try {
+    const { readdir } = await import('node:fs/promises')
+    names = (await readdir(dir)).filter(f => WATCH_EXT.test(f))
+  } catch (e) {
+    console.warn(`[rag-kb] 扫描目录失败 ${dir}: ${String((e as Error).message)}`)
+    return
+  }
+  let indexed = 0
+  // 串行索引：并发跑多个 embedding 会互相争抢 GPU/内存，整体反而更慢
+  for (const f of names) {
+    const r = await indexOne(ctx, join(dir, f), 'watch')
+    if (r.ok && !r.message.includes('跳过')) indexed++
+  }
+  if (indexed > 0) console.log(`[rag-kb] 启动扫描补索引 ${indexed} 个文件（${dir}）`)
 }
 
 /** 混合语义检索（向量+关键词）+ 可选 reranker 精排 + 引用元数据 */
@@ -136,7 +176,7 @@ export function apply(ctx: Context, config: Partial<KbConfig> = {}): void {
       const watcher = watch(dir, { persistent: false }, (_ev: unknown, filename: unknown) => {
         if (filename === null || filename === undefined) return
         const fname = String(filename)
-        if (!/\.(pdf|docx|md|txt|csv|json|log)$/i.test(fname)) return
+        if (!WATCH_EXT.test(fname)) return
         // 写稳定后索引（等 2 秒避免读到半写文件）
         const f = join(dir, fname)
         setTimeout(() => {
@@ -144,6 +184,8 @@ export function apply(ctx: Context, config: Partial<KbConfig> = {}): void {
         }, 2000)
       })
       ctx.effect(() => { watcher.close(); return undefined }, 'rag-kb: dir watcher')
+      // 补扫存量：DSH 未运行期间放进目录的文件不会被 watch 捕获
+      void scanWatchDir(ctx, dir)
     } catch (e) {
       console.warn(`[rag-kb] 目录监视失败 ${dir}: ${String((e as Error).message)}`)
     }
@@ -215,11 +257,12 @@ export function apply(ctx: Context, config: Partial<KbConfig> = {}): void {
         if (a.action === 'save' && a.text !== undefined && a.text !== '') {
           const title = a.title !== undefined && a.title !== '' ? a.title : `对话保存 ${new Date().toISOString().slice(0, 16)}`
           const content = `# ${title}\n\n${a.text}`
-          const docId = KbStore.docId(content)
+          // save 文档没有源文件路径，仍以内容 hash 作为身份
+          const docId = KbStore.hashContent(content)
           if (s.hasDoc(docId) && s.getDoc(docId)?.status === 'ready') {
             return { ok: true, message: `${title} 已在知识库中（内容相同，跳过）` }
           }
-          s.upsertDoc(docId, title, 'save', content.length, 'indexing')
+          s.upsertDoc(docId, title, 'save', content.length, docId, 'indexing')
           broadcastProgress(`正在索引对话内容「${title}」`)
           try {
             const embedder = await getEmbedder(cfg?.embeddingModel ?? 'Xenova/bge-small-zh-v1.5')

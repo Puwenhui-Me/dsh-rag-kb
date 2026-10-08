@@ -6,15 +6,16 @@
 
 import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite'
 
 /** 库归属标识（PRAGMA application_id，抄宿主 session-query-sqlite 惯例） */
 const APP_ID = 0x52414742 // 'RAGB'
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
 export interface DocumentRow {
   doc_id: string
+  content_hash: string
   name: string
   source: 'upload' | 'watch'
   bytes: number
@@ -49,6 +50,7 @@ export class KbStore {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS documents(
         doc_id TEXT PRIMARY KEY,
+        content_hash TEXT NOT NULL DEFAULT '',
         name TEXT NOT NULL,
         source TEXT NOT NULL DEFAULT 'upload',
         bytes INTEGER NOT NULL DEFAULT 0,
@@ -72,10 +74,21 @@ export class KbStore {
         tokenize='trigram'
       );
     `)
+    // 旧库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段
+    try { this.db.exec("ALTER TABLE documents ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''") } catch { /* 列已存在 */ }
   }
 
-  /** 文档内容 hash 作 doc_id（同名不同内容=不同文档） */
-  static docId(content: Buffer | string): string {
+  /**
+   * 文件绝对路径 → doc_id：同一路径的文件内容变化时 doc_id 保持不变，
+   * 由 upsertDoc + insertChunks 覆盖更新，不会在库里留下旧版本。
+   * 路径转小写以适配 Windows 大小写不敏感。
+   */
+  static docIdFromPath(filePath: string): string {
+    return createHash('sha256').update(resolve(filePath).toLowerCase()).digest('hex').slice(0, 16)
+  }
+
+  /** 内容 hash：save 文档以它为 doc_id；文件文档用它判断内容是否变化 */
+  static hashContent(content: Buffer | string): string {
     return createHash('sha256').update(content).digest('hex').slice(0, 16)
   }
 
@@ -83,13 +96,13 @@ export class KbStore {
     return this.db.prepare('SELECT 1 FROM documents WHERE doc_id=?').get(docId) !== undefined
   }
 
-  upsertDoc(docId: string, name: string, source: 'upload' | 'watch', bytes: number, status: DocumentRow['status'], error = ''): void {
+  upsertDoc(docId: string, name: string, source: 'upload' | 'watch', bytes: number, contentHash: string, status: DocumentRow['status'], error = ''): void {
     const now = new Date().toISOString()
     this.db.prepare(`
-      INSERT INTO documents(doc_id, name, source, bytes, chunk_count, status, error, created_at, updated_at)
-      VALUES(?,?,?,?,0,?,?,?,?)
-      ON CONFLICT(doc_id) DO UPDATE SET name=excluded.name, bytes=excluded.bytes, status=excluded.status, error=excluded.error, updated_at=excluded.updated_at
-    `).run(docId, name, source, bytes, status, error, now, now)
+      INSERT INTO documents(doc_id, content_hash, name, source, bytes, chunk_count, status, error, created_at, updated_at)
+      VALUES(?,?,?,?,?,0,?,?,?,?)
+      ON CONFLICT(doc_id) DO UPDATE SET content_hash=excluded.content_hash, name=excluded.name, bytes=excluded.bytes, status=excluded.status, error=excluded.error, updated_at=excluded.updated_at
+    `).run(docId, contentHash, name, source, bytes, status, error, now, now)
     this.loaded = false
   }
 
